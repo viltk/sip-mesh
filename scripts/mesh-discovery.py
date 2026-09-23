@@ -275,8 +275,8 @@ def write_neighbors(peers):
                 '"neighbor_node_info", '
                 f'"cluster_id={CLUSTER_ID},'
                 f'node_id={node_id},'
-                f'url=bin:{peer["ip"]}:'
-                f'{peer["bin_port"]}")\n'
+                f'url=bin:{peer["ip"]}:{peer["bin_port"]},'
+                f'sip_addr=sip:{peer["ip"]}:{peer["sip_port"]}")\n'
             )
 
             f.write(line)
