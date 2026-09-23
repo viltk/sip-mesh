@@ -1,0 +1,343 @@
+import socket
+import json
+import ipaddress
+import os
+import time
+import secrets
+import threading
+
+DISCOVERY_PORT = 47777
+CLUSTER_ID = 1
+BIN_PORT = 5566
+SIP_PORT = 5060
+
+OUTPUT_FILE = "/etc/opensips/conf.d/neighbors.cfg"
+NODE_ID_FILE = "/etc/sipmesh-node-id"
+
+MAX_BOOTSTRAP_PEERS = 3
+
+# Lab setting. Later derive this from the real interface netmask.
+PREFIX_LENGTH = 24
+
+
+def get_node_id():
+    with open(NODE_ID_FILE, "r") as f:
+        return int(f.read().strip())
+
+
+def get_local_ip():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        sock.connect(("192.0.2.1", 9))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+MY_NODE_ID = get_node_id()
+MY_IP = get_local_ip()
+
+NETWORK = ipaddress.ip_network(
+    f"{MY_IP}/{PREFIX_LENGTH}",
+    strict=False
+)
+
+
+def make_message(msg_type, nonce):
+    return {
+        "protocol": "SIPMESH/1",
+        "type": msg_type,
+        "cluster": CLUSTER_ID,
+        "node": MY_NODE_ID,
+        "ip": MY_IP,
+        "bin_port": BIN_PORT,
+        "sip_port": SIP_PORT,
+        "nonce": nonce
+    }
+
+
+def listener(stop_event):
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind(
+        ("0.0.0.0", DISCOVERY_PORT)
+    )
+
+    sock.settimeout(0.5)
+
+    print(
+        f"Listening for SIP-MESH discovery "
+        f"on UDP/{DISCOVERY_PORT}"
+    )
+
+    while not stop_event.is_set():
+
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        try:
+            msg = json.loads(data.decode())
+        except Exception:
+            continue
+
+        if msg.get("protocol") != "SIPMESH/1":
+            continue
+
+        if msg.get("cluster") != CLUSTER_ID:
+            continue
+
+        if msg.get("node") == MY_NODE_ID:
+            continue
+
+        if msg.get("type") != "DISCOVER":
+            continue
+
+        nonce = msg.get("nonce")
+
+        if not nonce:
+            continue
+
+        reply = make_message(
+            "OFFER",
+            nonce
+        )
+
+        try:
+            sock.sendto(
+                json.dumps(reply).encode(),
+                addr
+            )
+        except OSError:
+            continue
+
+        print(
+            f"Answered discovery from "
+            f"node {msg.get('node')} "
+            f"at {addr[0]}"
+        )
+
+    sock.close()
+
+
+def discover():
+    nonce = secrets.token_hex(8)
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM
+    )
+
+    sock.bind(
+        (MY_IP, 0)
+    )
+
+    # 50 ms per host for this lab.
+    sock.settimeout(0.05)
+
+    request = make_message(
+        "DISCOVER",
+        nonce
+    )
+
+    payload = json.dumps(
+        request
+    ).encode()
+
+    print(f"My node ID : {MY_NODE_ID}")
+    print(f"My IP      : {MY_IP}")
+    print(f"Scanning   : {NETWORK}")
+    print()
+
+    peers = {}
+
+    for host in NETWORK.hosts():
+
+        target_ip = str(host)
+
+        if target_ip == MY_IP:
+            continue
+
+        try:
+            sock.sendto(
+                payload,
+                (
+                    target_ip,
+                    DISCOVERY_PORT
+                )
+            )
+        except OSError:
+            continue
+
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            continue
+
+        try:
+            msg = json.loads(
+                data.decode()
+            )
+        except Exception:
+            continue
+
+        if msg.get("protocol") != "SIPMESH/1":
+            continue
+
+        if msg.get("type") != "OFFER":
+            continue
+
+        if msg.get("cluster") != CLUSTER_ID:
+            continue
+
+        if msg.get("nonce") != nonce:
+            continue
+
+        node_id = msg.get("node")
+
+        if not isinstance(node_id, int):
+            continue
+
+        if node_id == MY_NODE_ID:
+            continue
+
+        peer_ip = addr[0]
+
+        peers[node_id] = {
+            "ip": peer_ip,
+            "bin_port": int(
+                msg.get(
+                    "bin_port",
+                    BIN_PORT
+                )
+            ),
+            "sip_port": int(
+                msg.get(
+                    "sip_port",
+                    SIP_PORT
+                )
+            )
+        }
+
+        print(
+            f"FOUND node={node_id} "
+            f"ip={peer_ip} "
+            f"BIN={peers[node_id]['bin_port']}"
+        )
+
+    sock.close()
+
+    return peers
+
+
+def write_neighbors(peers):
+    selected = dict(
+        sorted(
+            peers.items()
+        )[:MAX_BOOTSTRAP_PEERS]
+    )
+
+    tmp_file = OUTPUT_FILE + ".tmp"
+
+    with open(
+        tmp_file,
+        "w"
+    ) as f:
+
+        f.write(
+            "# AUTO-GENERATED BY SIP-MESH\n"
+        )
+
+        f.write(
+            "# DO NOT EDIT\n\n"
+        )
+
+        for node_id, peer in selected.items():
+
+            line = (
+                'modparam('
+                '"clusterer", '
+                '"neighbor_node_info", '
+                f'"cluster_id={CLUSTER_ID},'
+                f'node_id={node_id},'
+                f'url=bin:{peer["ip"]}:'
+                f'{peer["bin_port"]}")\n'
+            )
+
+            f.write(line)
+
+    os.replace(
+        tmp_file,
+        OUTPUT_FILE
+    )
+
+    print()
+
+    print(
+        f"Wrote {len(selected)} "
+        f"bootstrap peer(s) to "
+        f"{OUTPUT_FILE}"
+    )
+
+
+def main():
+    stop_event = threading.Event()
+
+    listener_thread = threading.Thread(
+        target=listener,
+        args=(stop_event,),
+        daemon=True
+    )
+
+    listener_thread.start()
+
+    time.sleep(0.5)
+
+    peers = discover()
+
+    write_neighbors(peers)
+
+    print()
+
+    print(
+        f"Discovery complete: "
+        f"{len(peers)} node(s) found"
+    )
+
+    print()
+    print(
+        "Continuing to answer "
+        "discovery requests."
+    )
+    print(
+        "Press Ctrl+C to stop."
+    )
+
+    try:
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print()
+        print("Stopping discovery service...")
+        stop_event.set()
+        listener_thread.join(timeout=1)
+
+
+if __name__ == "__main__":
+    main()
